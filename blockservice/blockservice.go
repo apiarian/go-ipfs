@@ -37,8 +37,11 @@ type BlockService interface {
 
 type blockService struct {
 	// TODO don't expose underlying impl details
-	blockstore blockstore.Blockstore
-	exchange   exchange.Interface
+	blockstore   blockstore.Blockstore
+	exchange     exchange.Interface
+	// If checkFirst is true then first check that a block doesn't
+	// already exist to avoid republishing the block on the exchange.
+	checkFirst   bool
 }
 
 // an Object is simply a typed block
@@ -56,6 +59,21 @@ func New(bs blockstore.Blockstore, rem exchange.Interface) BlockService {
 	return &blockService{
 		blockstore: bs,
 		exchange:   rem,
+		checkFirst: true,
+	}
+}
+
+// NewWriteThrough ceates a BlockService that guarantees writes will go
+// through to the blockstore and are not skipped by cache checks.
+func NewWriteThrough(bs blockstore.Blockstore, rem exchange.Interface) BlockService {
+	if rem == nil {
+		log.Warning("blockservice running in local (offline) mode.")
+	}
+
+	return &blockService{
+		blockstore: bs,
+		exchange:   rem,
+		checkFirst: false,
 	}
 }
 
@@ -70,22 +88,19 @@ func (bs *blockService) Exchange() exchange.Interface {
 // AddBlock adds a particular block to the service, Putting it into the datastore.
 // TODO pass a context into this if the remote.HasBlock is going to remain here.
 func (s *blockService) AddObject(o Object) (*cid.Cid, error) {
-	// TODO: while this is a great optimization, we should think about the
-	// possibility of streaming writes directly to disk. If we can pass this object
-	// all the way down to the datastore without having to 'buffer' its data,
-	// we could implement a `WriteTo` method on it that could do a streaming write
-	// of the content, saving us (probably) considerable memory.
 	c := o.Cid()
-	has, err := s.blockstore.Has(key.Key(c.Hash()))
-	if err != nil {
-		return nil, err
+	if s.checkFirst {
+		has, err := s.blockstore.Has(key.Key(c.Hash()))
+		if err != nil {
+			return nil, err
+		}
+
+		if has {
+			return c, nil
+		}
 	}
 
-	if has {
-		return c, nil
-	}
-
-	err = s.blockstore.Put(o)
+	err := s.blockstore.Put(o)
 	if err != nil {
 		return nil, err
 	}
@@ -103,13 +118,14 @@ func (s *blockService) AddObjects(bs []Object) ([]*cid.Cid, error) {
 	for _, b := range bs {
 		c := b.Cid()
 
-		has, err := s.blockstore.Has(key.Key(c.Hash()))
-		if err != nil {
-			return nil, err
-		}
-
-		if has {
-			continue
+		if s.checkFirst {
+			has, err := s.blockstore.Has(key.Key(c.Hash()))
+			if err != nil {
+				return nil, err
+			}
+			if has {
+				continue
+			}
 		}
 
 		toput = append(toput, b)
